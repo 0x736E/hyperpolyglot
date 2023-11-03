@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
 };
+use std::io::Cursor;
 
 pub mod detectors;
 pub mod filters;
@@ -156,6 +157,87 @@ pub fn detect(path: &Path) -> Result<Option<Detection>, std::io::Error> {
 
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
+
+    let candidates = filter_candidates(
+        candidates,
+        detectors::get_languages_from_shebang(&mut reader)?,
+    );
+    if candidates.len() == 1 {
+        return Ok(Some(Detection::Shebang(candidates[0])));
+    };
+    reader.seek(SeekFrom::Start(0))?;
+
+    let mut content = String::new();
+    reader.read_to_string(&mut content)?;
+    let content = truncate_to_char_boundary(&content, MAX_CONTENT_SIZE_BYTES);
+
+    // using heuristics is only going to be useful if we have more than one candidate
+    // if the extension didn't result in candidate languages then the heuristics won't either
+    let candidates = if candidates.len() > 1 {
+        if let Some(extension) = extension {
+            let languages =
+                detectors::get_languages_from_heuristics(&extension[..], &candidates, &content);
+            filter_candidates(candidates, languages)
+        } else {
+            candidates
+        }
+    } else {
+        candidates
+    };
+
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(Some(Detection::Heuristics(candidates[0]))),
+        _ => Ok(Some(Detection::Classifier(detectors::classify(
+            &content,
+            &candidates,
+        )))),
+    }
+}
+
+/// Detects the programming language of a given file path or string contents of a file.
+///
+/// If the language cannot be determined, None will be returned.
+/// `detect` will error on an io error or if the parser returns an error when tokenizing the
+/// contents of the file
+///
+/// # Examples
+/// ```
+/// use std::path::Path;
+/// use hyperpolyglot::{detect, Detection};
+///
+/// let path = Path::new("src/bin/main.py");
+/// let str_input = "def myfunc():\
+///     x = 1 + 2
+///     print(\"x\")
+/// "
+/// let language = detect_with_str(path, str_input).unwrap().unwrap();
+/// assert_eq!(Detection::Heuristics("Rust"), language);
+/// ```
+pub fn detect_with_str(path: &Path, str_input: &str) -> Result<Option<Detection>, std::io::Error> {
+    let filename = match path.file_name() {
+        Some(filename) => filename.to_str(),
+        None => return Ok(None),
+    };
+
+    let candidate = filename.and_then(|filename| detectors::get_language_from_filename(filename));
+    if let Some(candidate) = candidate {
+        return Ok(Some(Detection::Filename(candidate)));
+    };
+
+    let extension = filename.and_then(|filename| detectors::get_extension(filename));
+
+    let candidates = extension
+        .map(|ext| detectors::get_languages_from_extension(ext))
+        .unwrap_or_else(Vec::new);
+
+    if candidates.len() == 1 {
+        return Ok(Some(Detection::Extension(candidates[0])));
+    };
+
+    // let file = File::open(path)?;
+    let cursor = Cursor::new(str_input);
+    let mut reader = BufReader::new(cursor);
 
     let candidates = filter_candidates(
         candidates,
